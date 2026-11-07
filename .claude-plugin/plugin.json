@@ -1,0 +1,6 @@
+{
+  "name": "usage-band",
+  "version": "0.1.0",
+  "description": "Dos barras sobre el prompt: uso semanal (azul) y ventana de 5 horas (naranja), con los minutos hasta el reinicio.",
+  "types": "./types/index.d.ts"
+}

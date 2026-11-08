@@ -1,6 +1,6 @@
 {
   "name": "usage-band",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Tres anillos sobre el prompt: contexto (verde), ventana de 5 horas (naranja) y semana (azul), con el tiempo hasta el reinicio.",
   "author": { "name": "Marcelo" },
   "types": "./types/index.d.ts"

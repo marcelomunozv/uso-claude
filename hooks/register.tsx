@@ -135,41 +135,64 @@ async function apply($: EngineInterface, reading: Reading): Promise<void> {
     merged = merge(prev, at, reading)
     return merged
   })
-  if (merged !== null && reading.rateLimits.length > 0) {
-    await $.store.set(STORE_KEY, savedOf(merged))
+  const hasWindows = reading.rateLimits.some(
+    l => l.kind === 'five_hour' || l.kind === 'seven_day',
+  )
+  if (merged !== null && hasWindows) {
+    const saved = savedOf(merged)
+    // Write only when the kept figures changed.
+    const before = asSaved(await $.store.get(STORE_KEY))
+    if (JSON.stringify(before) !== JSON.stringify(saved)) {
+      await $.store.set(STORE_KEY, saved)
+    }
+  }
+}
+
+// Poll the engine's figures; a failure waits for the next tick.
+async function poll($: EngineInterface): Promise<void> {
+  try {
+    await apply($, await $.session.usage())
+  } catch {
+    // Nothing to do: the next tick or reply reads again.
   }
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    // Refresh every 30 seconds; the countdowns redraw with the figures.
+    // Started first, so a failure below never leaves the session without it.
+    $.clock.every(30_000, () => {
+      void poll($)
+    })
+
     // Start from the last known rate limits, so the rings show before the first reply.
-    const saved = asSaved(await $.store.get(STORE_KEY))
-    if (saved) {
+    try {
+      const saved = asSaved(await $.store.get(STORE_KEY))
       const at = await $.clock.now()
-      await update($, usage, prev => ({ ...prev, ...saved, at }))
+      await update($, usage, prev => ({ ...prev, ...(saved ?? {}), at }))
+    } catch {
+      // No saved figures: the first reading fills them in.
     }
 
-    await apply($, await $.session.usage())
-
-    // Refresh every 30 seconds; the countdowns redraw with the figures.
-    $.clock.every(30_000, () => {
-      void (async () => {
-        await apply($, await $.session.usage())
-      })()
-    })
+    await poll($)
 
     return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
-    await apply($, e)
+    try {
+      await apply($, e)
+    } catch {
+      // The next reading tries again.
+    }
 
     return next(e)
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const u = await read($, usage)
-    if (u.at === 0) return next(e)
+    // Leave the band to the engine while a survey shows, or before any figures.
+    if (u.at === 0 || e.props.hasSurvey) return next(e)
 
     const ui = $.ui.resolve(e)
     const { Box, Text } = ui

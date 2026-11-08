@@ -29,9 +29,12 @@ test('the band shows 5h and 7d from a reading, and keeps them when a later readi
     store.set(e.key, e.value)
     return { value: undefined }
   })
-  on('session.usage', () => ({
-    value: { startedAt: 0, context: { window: 200000, tokens: 36000, percent: 18 }, rateLimits: LIMITS },
-  }))
+  // The first reading reports the windows; every later one (the 30 s poll) reports none,
+  // as the engine does before a reply carries them: they must not be wiped.
+  let reads = 0
+  on('session.usage', () => (reads++ === 0
+    ? { value: { startedAt: 0, context: { window: 200000, tokens: 36000, percent: 18 }, rateLimits: LIMITS } }
+    : { value: { startedAt: 0, context: { window: 200000 }, rateLimits: [] } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('clock.now', () => ({ value: Date.parse('2099-01-01T00:00:00Z') }))
   on('clock.every', () => ({ value: undefined }))
@@ -48,10 +51,9 @@ test('the band shows 5h and 7d from a reading, and keeps them when a later readi
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
-    // The engine's own figures (the mocked $.session.usage, polled) stand for the context.
-    expect((await ui.find({ type: 'Text', text: /context/ }))?.text).toMatch(/^(18|20)% context$/)
-    expect((await ui.find({ type: 'Text', text: /5h/ }))?.text).toContain('8%')
-    expect((await ui.find({ type: 'Text', text: /7d/ }))?.text).toContain('3%')
+    expect((await ui.find({ type: 'Text', text: /context/ }))?.text).toBe('20% context')
+    expect((await ui.find({ type: 'Text', text: /5h/ }))?.text).toBe('8% 5h - 5h 0m')
+    expect((await ui.find({ type: 'Text', text: /7d/ }))?.text).toBe('3% 7d - 6d 0h')
     await ui.unmount()
   }
 
@@ -119,5 +121,25 @@ test('a reading with new rate limits updates the band', async ($, on) => {
   expect((await ui.find({ type: 'Text', text: /7d/ }))?.text).toContain('4%')
   expect((await ui.find({ type: 'Text', text: /context/ }))?.text).toContain('20%')
   expect(store.get('limits')).toEqual({ weekPct: 4, weekResetsAt: FUTURE_7D, fiveHourPct: 9, fiveHourResetsAt: FUTURE_5H })
+  await ui.unmount()
+})
+
+test('the band still draws when the saved figures cannot be read', async ($, on) => {
+  on('store.get', () => {
+    throw new Error('store down')
+  })
+  on('store.set', () => ({ value: undefined }))
+  on('session.usage', () => ({
+    value: { startedAt: 0, context: { window: 200000, tokens: 36000, percent: 18 }, rateLimits: LIMITS },
+  }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('clock.now', () => ({ value: Date.parse('2099-01-01T00:00:00Z') }))
+  on('clock.every', () => ({ value: undefined }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /context/ }))?.text).toBe('18% context')
+  expect((await ui.find({ type: 'Text', text: /5h/ }))?.text).toBe('8% 5h - 5h 0m')
   await ui.unmount()
 })

@@ -1,5 +1,6 @@
 {
   "name": "usage-band-marketplace",
+  "description": "Mod usage-band para Claude Code: anillos de contexto, 5h y 7d sobre el prompt.",
   "owner": { "name": "Marcelo" },
   "plugins": [{ "name": "usage-band", "source": "./" }]
 }

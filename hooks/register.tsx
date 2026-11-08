@@ -1,12 +1,21 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
 import type { UsageSnapshot as Snapshot } from '../types'
 
+type Limit = { kind: string; percentUsed: number; resetsAt?: string }
 type Reading = {
   context: { percent?: number }
-  rateLimits: { kind: string; percentUsed: number; resetsAt?: string }[]
+  rateLimits: Limit[]
 }
+
+// The rate-limit figures kept across sessions, so a new session (or a reply that
+// reports no rate-limit windows) shows the last known values instead of dashes.
+type SavedLimits = Pick<
+  Snapshot,
+  'weekPct' | 'weekResetsAt' | 'fiveHourPct' | 'fiveHourResetsAt'
+>
+const STORE_KEY = 'limits'
 
 const EMPTY: Snapshot = {
   at: 0,
@@ -26,21 +35,58 @@ const GREEN = '#22c55e'
 const ORANGE = '#f97316'
 const BLUE = '#3b82f6'
 
-const toSnapshot = (at: number, { context, rateLimits }: Reading): Snapshot => {
+const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
+const isStrOrNull = (v: unknown): v is string | null => v === null || typeof v === 'string'
+
+const asSaved = (v: unknown): SavedLimits | null => {
+  if (typeof v !== 'object' || v === null) return null
+  const o = v as Record<string, unknown>
+  const pct = (x: unknown) => (isNum(x) ? x : null)
+  const iso = (x: unknown) => (isStrOrNull(x) ? x : null)
+  return {
+    weekPct: pct(o.weekPct),
+    weekResetsAt: iso(o.weekResetsAt),
+    fiveHourPct: pct(o.fiveHourPct),
+    fiveHourResetsAt: iso(o.fiveHourResetsAt),
+  }
+}
+
+// Merge a reading into the previous snapshot: a window the reading does not
+// carry keeps its previous figures; a context reading without a percent keeps
+// the previous one.
+const merge = (prev: Snapshot, at: number, { context, rateLimits }: Reading): Snapshot => {
   const week = rateLimits.find(l => l.kind === 'seven_day')
   const five = rateLimits.find(l => l.kind === 'five_hour')
   return {
     at,
-    contextPct: context.percent ?? null,
-    weekPct: week?.percentUsed ?? null,
-    weekResetsAt: week?.resetsAt ?? null,
-    fiveHourPct: five?.percentUsed ?? null,
-    fiveHourResetsAt: five?.resetsAt ?? null,
+    contextPct: isNum(context.percent) ? context.percent : prev.contextPct,
+    weekPct: week ? week.percentUsed : prev.weekPct,
+    weekResetsAt: week ? (week.resetsAt ?? null) : prev.weekResetsAt,
+    fiveHourPct: five ? five.percentUsed : prev.fiveHourPct,
+    fiveHourResetsAt: five ? (five.resetsAt ?? null) : prev.fiveHourResetsAt,
   }
 }
 
-const minutesUntil = (iso: string | null, now: number): number | null =>
-  iso === null ? null : Math.max(0, Math.round((Date.parse(iso) - now) / 60000))
+const savedOf = (s: Snapshot): SavedLimits => ({
+  weekPct: s.weekPct,
+  weekResetsAt: s.weekResetsAt,
+  fiveHourPct: s.fiveHourPct,
+  fiveHourResetsAt: s.fiveHourResetsAt,
+})
+
+const minutesUntil = (iso: string | null, now: number): number | null => {
+  if (iso === null) return null
+  const t = Date.parse(iso)
+  if (!Number.isFinite(t)) return null
+  return Math.max(0, Math.round((t - now) / 60000))
+}
+
+// Once a window's reset time has passed, its stored share no longer holds.
+const isPast = (iso: string | null, now: number): boolean => {
+  if (iso === null) return false
+  const t = Date.parse(iso)
+  return Number.isFinite(t) && t <= now
+}
 
 const fmtMinutes = (mins: number | null): string => {
   if (mins === null) return ''
@@ -78,18 +124,37 @@ const ringSvg = (pct: number | null, color: string): string => {
 const fmtPct = (pct: number | null): string =>
   pct === null ? '–' : `${Math.round(pct)}%`
 
+// Apply a reading: merge it, keep it for the drawing, and remember the
+// rate-limit figures across sessions when the reading carried any.
+async function apply($: EngineInterface, reading: Reading): Promise<void> {
+  const at = await $.clock.now()
+  // Merge inside update, against the value it read with its version, so a
+  // concurrent write is never overwritten with stale figures.
+  let merged: Snapshot | null = null
+  await update($, usage, prev => {
+    merged = merge(prev, at, reading)
+    return merged
+  })
+  if (merged !== null && reading.rateLimits.length > 0) {
+    await $.store.set(STORE_KEY, savedOf(merged))
+  }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    const startedAt = await $.clock.now()
-    const first = await $.session.usage()
-    await update($, usage, () => toSnapshot(startedAt, first))
+    // Start from the last known rate limits, so the rings show before the first reply.
+    const saved = asSaved(await $.store.get(STORE_KEY))
+    if (saved) {
+      const at = await $.clock.now()
+      await update($, usage, prev => ({ ...prev, ...saved, at }))
+    }
+
+    await apply($, await $.session.usage())
 
     // Refresh every 30 seconds; the countdowns redraw with the figures.
     $.clock.every(30_000, () => {
       void (async () => {
-        const now = await $.clock.now()
-        const fresh = await $.session.usage()
-        await update($, usage, () => toSnapshot(now, fresh))
+        await apply($, await $.session.usage())
       })()
     })
 
@@ -97,8 +162,7 @@ export const register: Register = on => {
   })
 
   on('session.measure', async ($, e, next) => {
-    const measuredAt = await $.clock.now()
-    await update($, usage, () => toSnapshot(measuredAt, e))
+    await apply($, e)
 
     return next(e)
   })
@@ -111,8 +175,13 @@ export const register: Register = on => {
     const { Box, Text } = ui
     const Svg = 'Svg' in ui ? ui.Svg : null
     const now = await $.clock.now()
-    const fiveLeft = fmtMinutes(minutesUntil(u.fiveHourResetsAt, now))
-    const weekLeft = fmtMinutes(minutesUntil(u.weekResetsAt, now))
+
+    const fiveDone = isPast(u.fiveHourResetsAt, now)
+    const weekDone = isPast(u.weekResetsAt, now)
+    const fivePct = fiveDone ? 0 : u.fiveHourPct
+    const weekPct = weekDone ? 0 : u.weekPct
+    const fiveLeft = fiveDone ? '' : fmtMinutes(minutesUntil(u.fiveHourResetsAt, now))
+    const weekLeft = weekDone ? '' : fmtMinutes(minutesUntil(u.weekResetsAt, now))
 
     // A real ring where the surface draws vectors (the desktop); text glyphs elsewhere.
     const Ring = (pct: number | null, color: string) =>
@@ -137,17 +206,17 @@ export const register: Register = on => {
           </Text>
         </Box>
         <Box flexDirection="row" alignItems="center" gap={1}>
-          {Ring(u.fiveHourPct, ORANGE)}
+          {Ring(fivePct, ORANGE)}
           <Text>
-            <Text bold>{fmtPct(u.fiveHourPct)}</Text>
-            <Text dimColor> 5h - {fiveLeft}</Text>
+            <Text bold>{fmtPct(fivePct)}</Text>
+            <Text dimColor> 5h{fiveLeft ? ` - ${fiveLeft}` : ''}</Text>
           </Text>
         </Box>
         <Box flexDirection="row" alignItems="center" gap={1}>
-          {Ring(u.weekPct, BLUE)}
+          {Ring(weekPct, BLUE)}
           <Text>
-            <Text bold>{fmtPct(u.weekPct)}</Text>
-            <Text dimColor> 7d - {weekLeft}</Text>
+            <Text bold>{fmtPct(weekPct)}</Text>
+            <Text dimColor> 7d{weekLeft ? ` - ${weekLeft}` : ''}</Text>
           </Text>
         </Box>
       </Box>
